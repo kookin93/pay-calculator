@@ -1,7 +1,5 @@
 from pathlib import Path
-from decimal import Decimal
-from decimal import ROUND_UP
-from decimal import ROUND_HALF_UP
+from decimal import Decimal, ROUND_HALF_UP, ROUND_FLOOR
 
 import streamlit as st
 
@@ -13,188 +11,197 @@ OFFICE_NAME = "인화세무회계컨설팅"
 OFFICE_PHONE = "042-222-7208"
 OFFICE_ADDRESS = "대전 중구 충무로 173 대현빌딩 6층"
 
+WEEKS_PER_MONTH = Decimal("4.345")  # 엑셀 고정값
+
+# 엑셀 AI19 AJ19 AK19 AL19
+PENSION_RATE = Decimal("0.045")
+HEALTH_RATE = Decimal("0.03545")
+CARE_RATE = Decimal("0.1295")
+EMPLOY_RATE = Decimal("0.009")
+
 
 def d(x) -> Decimal:
     return Decimal(str(x))
 
 
-def roundup_0(x: Decimal) -> Decimal:
-    return x.quantize(Decimal("1"), rounding=ROUND_UP)
-
-
-def round_half_up_0(x: Decimal) -> Decimal:
+def round0(x: Decimal) -> Decimal:
+    # 엑셀 ROUND(x,0) 동작을 양수 기준으로 동일하게 맞춤
     return x.quantize(Decimal("1"), rounding=ROUND_HALF_UP)
 
 
-def format_won(x: Decimal) -> str:
+def floor_to_step(x: Decimal, step: Decimal) -> Decimal:
+    # 엑셀 ROUNDDOWN(x, -n) 대응
+    # step=1000 이면 천 단위 버림
+    # step=10 이면 십 단위 버림
+    if step == 0:
+        return x
+    return (x / step).to_integral_value(rounding=ROUND_FLOOR) * step
+
+
+def won(x: Decimal) -> str:
     return f"{int(x):,}원"
 
 
 def compute(
-    annual_salary: Decimal,
-    weekly_work_hours: Decimal,
-    weekly_ot_hours: Decimal,
-    min_wage: Decimal,
-    meal_allowance: Decimal,
-    car_allowance: Decimal,
+    annual_salary: Decimal,        # Z
+    daily_work_hours: Decimal,     # L
+    weekly_ot_hours: Decimal,      # P
+    work_days_per_week: Decimal,   # M13
+    min_wage: Decimal,             # AR6
+    min_inclusion_ratio: Decimal,  # AR10
+    meal: Decimal,                 # S
+    car: Decimal,                  # T
+    child: Decimal,                # U
+    duty: Decimal,                 # V
+    grade: Decimal,                # W
+    etc_allow: Decimal,            # X
+    etc_deduct: Decimal,           # AM
 ) -> dict:
-    factor = d("4.345")
+    # AR7 = ROUND(AR6*209,0)
+    min_monthly_wage = round0(min_wage * Decimal("209"))
 
-    weekly_holiday_hours = weekly_work_hours / d("5")
-    weekly_paid_hours = weekly_work_hours + weekly_holiday_hours
+    # AR11 = ROUND(AR7*AR10,0)
+    min_non_included = round0(min_monthly_wage * min_inclusion_ratio)
 
-    monthly_standard_hours = roundup_0(weekly_paid_hours * factor)
-    monthly_ot_hours = roundup_0(weekly_ot_hours * factor)
+    # Y = ROUND(Z/12,0)
+    monthly_pay = round0(annual_salary / Decimal("12"))
 
-    monthly_salary = annual_salary / d("12")
+    # M = ROUND(((L*근로일)+L)*4.345,0)
+    monthly_standard_hours = round0(((daily_work_hours * work_days_per_week) + daily_work_hours) * WEEKS_PER_MONTH)
 
-    denominator = monthly_standard_hours + (monthly_ot_hours * d("1.5"))
-    if denominator == 0:
-        raise ValueError("시간 값이 0이어서 계산할 수 없습니다")
+    # Q = P*4.345
+    monthly_ot_hours = weekly_ot_hours * WEEKS_PER_MONTH
 
-    hourly = (monthly_salary - meal_allowance - car_allowance) / denominator
+    # R = M + (P*1.5*4.345)
+    weighted_total_hours = monthly_standard_hours + (weekly_ot_hours * Decimal("1.5") * WEEKS_PER_MONTH)
 
-    base_pay = roundup_0(hourly * monthly_standard_hours)
-    fixed_ot_pay = roundup_0(hourly * monthly_ot_hours * d("1.5"))
-    total_pay = base_pay + fixed_ot_pay + meal_allowance + car_allowance
+    if weighted_total_hours == 0:
+        raise ValueError("시간 값이 0이라 계산할 수 없습니다")
 
-    diff = total_pay - monthly_salary
-    min_wage_result = "최저이상" if hourly >= min_wage else "최저미만"
+    # AB = Y / R
+    hourly = monthly_pay / weighted_total_hours
+
+    # O = ROUND(Q*AB*1.5,0)
+    fixed_ot_pay = round0(monthly_ot_hours * hourly * Decimal("1.5"))
+
+    # 수당 합계
+    allowances_sum = meal + car + child + duty + grade + etc_allow
+
+    # N = Y - (O + 수당합계)
+    base_pay = monthly_pay - (fixed_ot_pay + allowances_sum)
+
+    # AA = CHECK
+    check_ok = (monthly_pay == (base_pay + fixed_ot_pay + allowances_sum))
+
+    # AC = 최저임금 비교기준임금
+    non_tax_sum = meal + car + child
+    if non_tax_sum > 0:
+        compare_wage = (base_pay + non_tax_sum - min_non_included) / monthly_standard_hours
+    else:
+        compare_wage = (base_pay + non_tax_sum) / monthly_standard_hours
+
+    # AD = 준수여부
+    compliance = "준수" if compare_wage >= min_wage else "미준수"
+
+    # AF = 과세금액 = Y - (S+T+U)
+    taxable = monthly_pay - non_tax_sum
+
+    # AG 소득세는 업로드 엑셀에서 #REF!로 IFERROR 처리되어 0이 됨
+    income_tax = Decimal("0")
+
+    # AH = 주민세 = ROUNDDOWN(AG*0.1,-1)
+    resident_tax = floor_to_step(income_tax * Decimal("0.1"), Decimal("10"))
+
+    # AI = 국민연금 = ROUNDDOWN(ROUNDDOWN(AF,-3)*0.045,-1)
+    pension_base = floor_to_step(taxable, Decimal("1000"))
+    pension = floor_to_step(pension_base * PENSION_RATE, Decimal("10"))
+
+    # AJ = 건강보험 = ROUNDDOWN(AF*0.03545,-1)
+    health = floor_to_step(taxable * HEALTH_RATE, Decimal("10"))
+
+    # AK = 장기요양 = ROUNDDOWN(AJ*0.1295,-1)
+    care = floor_to_step(health * CARE_RATE, Decimal("10"))
+
+    # AL = 고용보험 = ROUNDDOWN(AF*0.009,-1)
+    employ = floor_to_step(taxable * EMPLOY_RATE, Decimal("10"))
+
+    # AN = 총 공제금액 = SUM(AG:AM)
+    total_deduct = income_tax + resident_tax + pension + health + care + employ + etc_deduct
+
+    # AO = 실지급액 = Y - AN
+    net_pay = monthly_pay - total_deduct
+
+    # 검증값
+    diff = (base_pay + fixed_ot_pay + allowances_sum) - monthly_pay
+    diff_abs = abs(diff)
 
     return {
-        "monthly_salary": monthly_salary,
-        "hourly": hourly,
-        "base_pay": base_pay,
+        "monthly_pay": monthly_pay,
+        "monthly_standard_hours": monthly_standard_hours,
+        "monthly_ot_hours": round0(monthly_ot_hours),
+        "hourly": round0(hourly),
+        "base_pay": round0(base_pay),
         "fixed_ot_pay": fixed_ot_pay,
-        "total_pay": total_pay,
-        "diff": diff,
-        "min_wage_result": min_wage_result,
-        "meal_allowance": meal_allowance,
-        "car_allowance": car_allowance,
+        "allowances_sum": round0(allowances_sum),
+        "check_ok": check_ok,
+        "compare_wage": round0(compare_wage),
+        "compliance": compliance,
+        "min_wage": round0(min_wage),
+        "taxable": round0(taxable),
+        "income_tax": round0(income_tax),
+        "resident_tax": round0(resident_tax),
+        "pension": round0(pension),
+        "health": round0(health),
+        "care": round0(care),
+        "employ": round0(employ),
+        "etc_deduct": round0(etc_deduct),
+        "total_deduct": round0(total_deduct),
+        "net_pay": round0(net_pay),
+        "diff_abs": round0(diff_abs),
     }
 
 
-def render_payslip_html(result: dict, min_wage: Decimal) -> str:
-    hourly_disp = round_half_up_0(result["hourly"])
-    min_wage_disp = round_half_up_0(min_wage)
-
-    base_pay_disp = result["base_pay"]
-    ot_pay_disp = result["fixed_ot_pay"]
-    meal_disp = roundup_0(d(result["meal_allowance"]))
-    car_disp = roundup_0(d(result["car_allowance"]))
-    total_disp = result["total_pay"]
-
-    html = f"""
-    <style>
-      .wrap {{
-        max-width: 860px;
-        margin: 0 auto;
-        padding-bottom: 78px;
-      }}
-      table.payslip {{
-        width: 100%;
-        border-collapse: collapse;
-        margin: 10px 0 18px 0;
-        font-size: 15px;
-      }}
-      table.payslip th {{
-        text-align: left;
-        padding: 10px 10px;
-        border: 1px solid #e6e6e6;
-        background: #fafafa;
-        font-weight: 700;
-      }}
-      table.payslip td {{
-        padding: 10px 10px;
-        border: 1px solid #e6e6e6;
-      }}
-      td.r {{
-        text-align: right;
-        white-space: nowrap;
-      }}
-      .kpi {{
-        display: grid;
-        grid-template-columns: 1fr 1fr;
-        gap: 12px;
-        margin-top: 6px;
-        margin-bottom: 12px;
-      }}
-      .card {{
-        border: 1px solid #e6e6e6;
-        border-radius: 10px;
-        padding: 12px 14px;
-        background: white;
-      }}
-      .card .t {{
-        font-size: 13px;
-        color: #666;
-        margin-bottom: 6px;
-      }}
-      .card .v {{
-        font-size: 20px;
-        font-weight: 800;
-      }}
-      .muted {{
-        color: #666;
-        font-size: 13px;
-      }}
-      .footer {{
-        position: fixed;
-        left: 0;
-        right: 0;
-        bottom: 0;
-        background: #ffffff;
-        border-top: 1px solid #e6e6e6;
-        padding: 10px 12px;
-        font-size: 13px;
-        color: #444;
-      }}
-      .footer-inner {{
-        max-width: 860px;
-        margin: 0 auto;
-        display: flex;
-        justify-content: space-between;
-        gap: 12px;
-        flex-wrap: wrap;
-      }}
-      .footer strong {{
-        font-weight: 700;
-      }}
-    </style>
-
-    <div class="wrap">
-      <div class="kpi">
-        <div class="card">
-          <div class="t">통상시급</div>
-          <div class="v">{format_won(hourly_disp)}</div>
-          <div class="muted">표시는 소수 첫째 자리에서 반올림</div>
+def render_footer() -> None:
+    st.markdown(
+        f"""
+        <style>
+          .footer {{
+            position: fixed;
+            left: 0;
+            right: 0;
+            bottom: 0;
+            background: #ffffff;
+            border-top: 1px solid #e6e6e6;
+            padding: 10px 12px;
+            font-size: 13px;
+            color: #444;
+            z-index: 9999;
+          }}
+          .footer-inner {{
+            max-width: 860px;
+            margin: 0 auto;
+            display: flex;
+            justify-content: space-between;
+            gap: 12px;
+            flex-wrap: wrap;
+          }}
+          .footer strong {{
+            font-weight: 700;
+          }}
+          .wrap-pad {{
+            padding-bottom: 78px;
+          }}
+        </style>
+        <div class="footer">
+          <div class="footer-inner">
+            <div><strong>{OFFICE_NAME}</strong></div>
+            <div>{OFFICE_PHONE}</div>
+            <div>{OFFICE_ADDRESS}</div>
+          </div>
         </div>
-        <div class="card">
-          <div class="t">최저시급 기준</div>
-          <div class="v">{format_won(min_wage_disp)}</div>
-          <div class="muted">{result["min_wage_result"]}</div>
-        </div>
-      </div>
-
-      <table class="payslip">
-        <tr><th colspan="2">급여 구성</th></tr>
-        <tr><td>기본급</td><td class="r">{format_won(base_pay_disp)}</td></tr>
-        <tr><td>고정연장수당</td><td class="r">{format_won(ot_pay_disp)}</td></tr>
-        <tr><td>식대</td><td class="r">{format_won(meal_disp)}</td></tr>
-        <tr><td>자가운전보조금</td><td class="r">{format_won(car_disp)}</td></tr>
-        <tr><td><b>총급여</b></td><td class="r"><b>{format_won(total_disp)}</b></td></tr>
-      </table>
-    </div>
-
-    <div class="footer">
-      <div class="footer-inner">
-        <div><strong>{OFFICE_NAME}</strong></div>
-        <div>{OFFICE_PHONE}</div>
-        <div>{OFFICE_ADDRESS}</div>
-      </div>
-    </div>
-    """
-    return html
+        """,
+        unsafe_allow_html=True,
+    )
 
 
 st.set_page_config(page_title="급여 계산기", layout="centered")
@@ -210,6 +217,7 @@ st.warning(
     "본 프로그램과 화면 구성 및 산출물은 저작권 보호 대상입니다\n"
     "사전 서면 동의 없이 복제 수정 배포 게시를 금지합니다"
 )
+
 st.info(
     "참고 안내\n"
     "본 계산 결과는 참고용입니다\n"
@@ -220,93 +228,111 @@ st.info(
 with st.sidebar:
     st.header("입력")
 
-    annual_salary_int = st.number_input(
-        "연봉",
-        min_value=0,
-        value=36000000,
-        step=100000,
-        format="%d",
-    )
+    annual_salary_int = st.number_input("상여금 제외 연봉", min_value=0, value=36000000, step=100000, format="%d")
 
-    weekly_work_hours_float = st.number_input(
-        "주 근로시간",
-        min_value=0.0,
-        value=40.0,
-        step=0.5,
-    )
+    work_days = st.number_input("주 근로일", min_value=1, value=5, step=1, format="%d")
+    daily_hours = st.number_input("1일 근로시간", min_value=0.0, value=8.0, step=0.5)
 
-    weekly_ot_hours_float = st.number_input(
-        "주 연장시간",
-        min_value=0.0,
-        value=9.0,
-        step=0.5,
-    )
+    weekly_ot = st.number_input("주 고정연장시간", min_value=0.0, value=9.0, step=0.5)
 
-    min_wage_int = st.number_input(
-        "최저시급",
-        min_value=0,
-        value=10320,
-        step=10,
-        format="%d",
-    )
+    st.divider()
+    st.subheader("최저임금")
+    min_wage_int = st.number_input("최저시급", min_value=0, value=10320, step=10, format="%d")
+    inclusion_ratio = st.number_input("최저 산입비율", min_value=0.0, max_value=1.0, value=0.0, step=0.01)
 
-    meal_allowance_int = st.number_input(
-        "식대",
-        min_value=0,
-        value=0,
-        step=10000,
-        format="%d",
-    )
+    st.divider()
+    st.subheader("비과세 수당")
+    meal_int = st.number_input("식대", min_value=0, value=0, step=10000, format="%d")
+    car_int = st.number_input("차량유지비", min_value=0, value=0, step=10000, format="%d")
+    child_int = st.number_input("자녀 양육수당", min_value=0, value=0, step=10000, format="%d")
 
-    car_allowance_int = st.number_input(
-        "자가운전보조금",
-        min_value=0,
-        value=0,
-        step=10000,
-        format="%d",
-    )
+    st.divider()
+    st.subheader("과세 수당")
+    duty_int = st.number_input("직책수당", min_value=0, value=0, step=10000, format="%d")
+    grade_int = st.number_input("직급수당", min_value=0, value=0, step=10000, format="%d")
+    etc_allow_int = st.number_input("기타수당", min_value=0, value=0, step=10000, format="%d")
 
-annual_salary = d(annual_salary_int)
-weekly_work_hours = d(weekly_work_hours_float)
-weekly_ot_hours = d(weekly_ot_hours_float)
-min_wage = d(min_wage_int)
-meal_allowance = d(meal_allowance_int)
-car_allowance = d(car_allowance_int)
+    st.divider()
+    st.subheader("기타 공제")
+    etc_deduct_int = st.number_input("기타공제", min_value=0, value=0, step=10000, format="%d")
 
 try:
-    result = compute(
-        annual_salary=annual_salary,
-        weekly_work_hours=weekly_work_hours,
-        weekly_ot_hours=weekly_ot_hours,
-        min_wage=min_wage,
-        meal_allowance=meal_allowance,
-        car_allowance=car_allowance,
+    r = compute(
+        annual_salary=d(annual_salary_int),
+        daily_work_hours=d(daily_hours),
+        weekly_ot_hours=d(weekly_ot),
+        work_days_per_week=d(work_days),
+        min_wage=d(min_wage_int),
+        min_inclusion_ratio=d(inclusion_ratio),
+        meal=d(meal_int),
+        car=d(car_int),
+        child=d(child_int),
+        duty=d(duty_int),
+        grade=d(grade_int),
+        etc_allow=d(etc_allow_int),
+        etc_deduct=d(etc_deduct_int),
     )
 except Exception as e:
     st.error(str(e))
     st.stop()
 
+st.markdown('<div class="wrap-pad">', unsafe_allow_html=True)
+
 st.subheader("계산 결과")
-st.markdown(render_payslip_html(result, min_wage), unsafe_allow_html=True)
-
-st.subheader("요약")
-monthly_salary_disp = round_half_up_0(result["monthly_salary"])
-total_disp = result["total_pay"]
-diff_abs = abs(result["diff"])
-
-status_ok = diff_abs <= d("1")
-status_text = "정상" if status_ok else "비정상"
-diff_abs_disp = round_half_up_0(diff_abs)
-
 col1, col2 = st.columns(2)
 with col1:
-    st.metric("월급여 기준", f"{int(monthly_salary_disp):,}원")
+    st.metric("총 월급여액", won(r["monthly_pay"]))
+    st.metric("기본급", won(r["base_pay"]))
+    st.metric("고정연장수당", won(r["fixed_ot_pay"]))
 with col2:
-    st.metric("총급여", f"{int(total_disp):,}원")
+    st.metric("통상시급", won(r["hourly"]))
+    st.metric("비과세 수당 합계", won(d(meal_int + car_int + child_int)))
+    st.metric("과세금액", won(r["taxable"]))
 
-if status_ok:
-    st.success(f"검증 결과. {status_text}. 차이 절대값 {int(diff_abs_disp):,}원")
+st.divider()
+st.subheader("최저임금")
+c1, c2, c3 = st.columns(3)
+with c1:
+    st.metric("최저시급", won(r["min_wage"]))
+with c2:
+    st.metric("비교기준임금", won(r["compare_wage"]))
+with c3:
+    st.metric("준수여부", r["compliance"])
+
+st.divider()
+st.subheader("공제와 실지급액")
+c1, c2 = st.columns(2)
+with c1:
+    st.write("소득세")
+    st.write(won(r["income_tax"]))
+    st.write("주민세")
+    st.write(won(r["resident_tax"]))
+    st.write("국민연금")
+    st.write(won(r["pension"]))
+    st.write("건강보험")
+    st.write(won(r["health"]))
+    st.write("장기요양보험")
+    st.write(won(r["care"]))
+    st.write("고용보험")
+    st.write(won(r["employ"]))
+    st.write("기타공제")
+    st.write(won(r["etc_deduct"]))
+with c2:
+    st.metric("총 공제금액", won(r["total_deduct"]))
+    st.metric("실지급액", won(r["net_pay"]))
+    st.caption("소득세는 업로드 엑셀에서 #REF!로 0 처리되는 상태를 그대로 반영했습니다")
+
+st.divider()
+st.subheader("검증")
+if r["diff_abs"] <= Decimal("1"):
+    st.success(f"정상. 차이 절대값 {int(r['diff_abs']):,}원")
 else:
-    st.error(f"검증 결과. {status_text}. 차이 절대값 {int(diff_abs_disp):,}원")
+    st.error(f"비정상. 차이 절대값 {int(r['diff_abs']):,}원")
 
-st.caption("검증 기준은 총급여 minus 월급여 입니다. 차이 절대값이 1원 이하이면 정상입니다")
+if r["check_ok"]:
+    st.caption("CHECK. OK")
+else:
+    st.caption("CHECK. NOTOK")
+
+render_footer()
+st.markdown("</div>", unsafe_allow_html=True)
