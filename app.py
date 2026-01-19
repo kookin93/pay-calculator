@@ -1,19 +1,28 @@
 from pathlib import Path
 from decimal import Decimal, ROUND_HALF_UP, ROUND_FLOOR
+import bisect
 
 import streamlit as st
+import openpyxl
 
 
 APP_DIR = Path(__file__).resolve().parent
+
 LOGO_FILENAME = "로고_검정색.png"
+
+# GitHub에 올린 엑셀 파일명 후보
+TAX_XLSX_CANDIDATES = [
+    "tax_table.xlsx",
+    "연봉테이블 (2).xlsx",
+    "연봉테이블.xlsx",
+]
 
 OFFICE_NAME = "인화세무회계컨설팅"
 OFFICE_PHONE = "042-222-7208"
 OFFICE_ADDRESS = "대전 중구 충무로 173 대현빌딩 6층"
 
-WEEKS_PER_MONTH = Decimal("4.345")  # 엑셀 고정값
+WEEKS_PER_MONTH = Decimal("4.345")
 
-# 엑셀 AI19 AJ19 AK19 AL19
 PENSION_RATE = Decimal("0.045")
 HEALTH_RATE = Decimal("0.03545")
 CARE_RATE = Decimal("0.1295")
@@ -25,14 +34,10 @@ def d(x) -> Decimal:
 
 
 def round0(x: Decimal) -> Decimal:
-    # 엑셀 ROUND(x,0) 동작을 양수 기준으로 동일하게 맞춤
     return x.quantize(Decimal("1"), rounding=ROUND_HALF_UP)
 
 
 def floor_to_step(x: Decimal, step: Decimal) -> Decimal:
-    # 엑셀 ROUNDDOWN(x, -n) 대응
-    # step=1000 이면 천 단위 버림
-    # step=10 이면 십 단위 버림
     if step == 0:
         return x
     return (x / step).to_integral_value(rounding=ROUND_FLOOR) * step
@@ -42,96 +47,211 @@ def won(x: Decimal) -> str:
     return f"{int(x):,}원"
 
 
-def compute(
-    annual_salary: Decimal,        # Z
-    daily_work_hours: Decimal,     # L
-    weekly_ot_hours: Decimal,      # P
-    work_days_per_week: Decimal,   # M13
-    min_wage: Decimal,             # AR6
-    min_inclusion_ratio: Decimal,  # AR10
-    meal: Decimal,                 # S
-    car: Decimal,                  # T
-    child: Decimal,                # U
-    duty: Decimal,                 # V
-    grade: Decimal,                # W
-    etc_allow: Decimal,            # X
-    etc_deduct: Decimal,           # AM
-) -> dict:
-    # AR7 = ROUND(AR6*209,0)
-    min_monthly_wage = round0(min_wage * Decimal("209"))
+def find_tax_xlsx_path() -> Path | None:
+    for name in TAX_XLSX_CANDIDATES:
+        p = APP_DIR / name
+        if p.exists():
+            return p
+    return None
 
-    # AR11 = ROUND(AR7*AR10,0)
+
+@st.cache_data(show_spinner=False)
+def load_withholding_table() -> dict:
+    """
+    엑셀: 간이세액표!A5:M651
+    - A: 이상(하한)
+    - B: 미만(상한)
+    - C~M: 공제대상가족수 1~11
+    """
+    p = find_tax_xlsx_path()
+    if p is None:
+        return {"ok": False, "message": "간이세액표 엑셀 파일을 찾지 못했습니다", "rows": []}
+
+    wb = openpyxl.load_workbook(p, data_only=True)
+    if "간이세액표" not in wb.sheetnames:
+        return {"ok": False, "message": "엑셀에 간이세액표 시트가 없습니다", "rows": []}
+
+    ws = wb["간이세액표"]
+
+    rows = []
+    # 실제 데이터는 보통 6행부터 시작
+    for r in range(6, ws.max_row + 1):
+        low = ws.cell(r, 1).value
+        high = ws.cell(r, 2).value
+        if low is None or high is None:
+            continue
+        if not isinstance(low, (int, float)) or not isinstance(high, (int, float)):
+            continue
+
+        vals = []
+        for c in range(3, 14):  # C~M
+            v = ws.cell(r, c).value
+            if v is None:
+                v = 0
+            vals.append(int(v))
+
+        rows.append((int(low), int(high), vals))
+
+    if not rows:
+        return {"ok": False, "message": "간이세액표 데이터가 비어 있습니다", "rows": []}
+
+    rows.sort(key=lambda x: x[0])
+    return {"ok": True, "message": "ok", "rows": rows}
+
+
+def vlookup_approx(monthly_taxable: int, family_count: int, table_rows: list) -> int:
+    """
+    엑셀 VLOOKUP(monthly_taxable, A5:M651, 2+family_count, 1) 근사
+    - family_count: 1~11
+    """
+    if family_count < 1:
+        family_count = 1
+    if family_count > 11:
+        family_count = 11
+
+    lows = [r[0] for r in table_rows]
+    idx = bisect.bisect_right(lows, monthly_taxable) - 1
+    if idx < 0:
+        raise KeyError("table underflow")
+
+    low, high, vals = table_rows[idx]
+    # 안전 체크
+    if not (low <= monthly_taxable < high):
+        # 엑셀 근사는 보통 low 기준이므로 여기서는 허용
+        pass
+
+    # C가 가족 1명
+    return int(vals[family_count - 1])
+
+
+def child_tax_credit(children_8to20: int) -> int:
+    """
+    엑셀 AG20 마지막 차감부
+    - 0명: 0
+    - 1명: 12,500
+    - 2명 이상: 29,160 + (인원-2)*25,000
+    """
+    if children_8to20 <= 0:
+        return 0
+    if children_8to20 == 1:
+        return 12500
+    return 29160 + (children_8to20 - 2) * 25000
+
+
+def compute_income_tax_from_excel_logic(
+    monthly_taxable: int,
+    family_count: int,
+    children_8to20: int,
+) -> Decimal:
+    """
+    엑셀 AG20 수식 구현
+    =IFERROR(ROUNDDOWN( ... , -1), 0) - 자녀세액공제
+    """
+    tbl = load_withholding_table()
+    base_tax = 0
+
+    try:
+        AF = monthly_taxable
+
+        if AF > 87000000:
+            v = Decimal("1507400") + Decimal("31034600") + d(AF - 87000000) * Decimal("0.45")
+        elif AF > 45000000:
+            v = Decimal("1507400") + Decimal("13394600") + d(AF - 45000000) * Decimal("0.42")
+        elif AF > 30000000:
+            v = Decimal("1507400") + Decimal("7394600") + d(AF - 30000000) * Decimal("0.4")
+        elif AF > 28000000:
+            v = Decimal("1507400") + Decimal("6610600") + d(AF - 28000000) * Decimal("0.98") * Decimal("0.4")
+        elif AF > 14000000:
+            v = Decimal("1507400") + Decimal("1397000") + d(AF - 14000000) * Decimal("0.98") * Decimal("0.38")
+        elif AF > 10000000:
+            v = Decimal("1507400") + Decimal("25000") + d(AF - 10000000) * Decimal("0.98") * Decimal("0.35")
+        elif AF == 10000000:
+            v = Decimal("1507400")
+        else:
+            if not tbl["ok"]:
+                raise KeyError(tbl["message"])
+            vlookup_val = vlookup_approx(AF, family_count, tbl["rows"])
+            v = d(vlookup_val)
+
+        # ROUNDDOWN( , -1) = 십원단위 버림
+        base_tax = int(floor_to_step(v, d("10")))
+
+    except Exception:
+        base_tax = 0
+
+    credit = child_tax_credit(children_8to20)
+    return d(base_tax - credit)
+
+
+def compute(
+    annual_salary: Decimal,
+    daily_work_hours: Decimal,
+    weekly_ot_hours: Decimal,
+    work_days_per_week: Decimal,
+    min_wage: Decimal,
+    min_inclusion_ratio: Decimal,
+    meal: Decimal,
+    car: Decimal,
+    child: Decimal,
+    duty: Decimal,
+    grade: Decimal,
+    etc_allow: Decimal,
+    etc_deduct: Decimal,
+    family_count: int,
+    children_8to20: int,
+) -> dict:
+    min_monthly_wage = round0(min_wage * d("209"))
     min_non_included = round0(min_monthly_wage * min_inclusion_ratio)
 
-    # Y = ROUND(Z/12,0)
-    monthly_pay = round0(annual_salary / Decimal("12"))
+    monthly_pay = round0(annual_salary / d("12"))
 
-    # M = ROUND(((L*근로일)+L)*4.345,0)
     monthly_standard_hours = round0(((daily_work_hours * work_days_per_week) + daily_work_hours) * WEEKS_PER_MONTH)
 
-    # Q = P*4.345
     monthly_ot_hours = weekly_ot_hours * WEEKS_PER_MONTH
 
-    # R = M + (P*1.5*4.345)
-    weighted_total_hours = monthly_standard_hours + (weekly_ot_hours * Decimal("1.5") * WEEKS_PER_MONTH)
-
+    weighted_total_hours = monthly_standard_hours + (weekly_ot_hours * d("1.5") * WEEKS_PER_MONTH)
     if weighted_total_hours == 0:
         raise ValueError("시간 값이 0이라 계산할 수 없습니다")
 
-    # AB = Y / R
     hourly = monthly_pay / weighted_total_hours
 
-    # O = ROUND(Q*AB*1.5,0)
-    fixed_ot_pay = round0(monthly_ot_hours * hourly * Decimal("1.5"))
+    fixed_ot_pay = round0(monthly_ot_hours * hourly * d("1.5"))
 
-    # 수당 합계
     allowances_sum = meal + car + child + duty + grade + etc_allow
 
-    # N = Y - (O + 수당합계)
     base_pay = monthly_pay - (fixed_ot_pay + allowances_sum)
 
-    # AA = CHECK
     check_ok = (monthly_pay == (base_pay + fixed_ot_pay + allowances_sum))
 
-    # AC = 최저임금 비교기준임금
     non_tax_sum = meal + car + child
     if non_tax_sum > 0:
         compare_wage = (base_pay + non_tax_sum - min_non_included) / monthly_standard_hours
     else:
         compare_wage = (base_pay + non_tax_sum) / monthly_standard_hours
 
-    # AD = 준수여부
     compliance = "준수" if compare_wage >= min_wage else "미준수"
 
-    # AF = 과세금액 = Y - (S+T+U)
     taxable = monthly_pay - non_tax_sum
 
-    # AG 소득세는 업로드 엑셀에서 #REF!로 IFERROR 처리되어 0이 됨
-    income_tax = Decimal("0")
+    # 소득세: 간이세액표 VLOOKUP 포함 엑셀 로직
+    income_tax = compute_income_tax_from_excel_logic(
+        monthly_taxable=int(taxable),
+        family_count=family_count,
+        children_8to20=children_8to20,
+    )
 
-    # AH = 주민세 = ROUNDDOWN(AG*0.1,-1)
-    resident_tax = floor_to_step(income_tax * Decimal("0.1"), Decimal("10"))
+    resident_tax = d(floor_to_step(income_tax * d("0.1"), d("10")))
 
-    # AI = 국민연금 = ROUNDDOWN(ROUNDDOWN(AF,-3)*0.045,-1)
-    pension_base = floor_to_step(taxable, Decimal("1000"))
-    pension = floor_to_step(pension_base * PENSION_RATE, Decimal("10"))
+    pension_base = floor_to_step(taxable, d("1000"))
+    pension = d(floor_to_step(pension_base * PENSION_RATE, d("10")))
 
-    # AJ = 건강보험 = ROUNDDOWN(AF*0.03545,-1)
-    health = floor_to_step(taxable * HEALTH_RATE, Decimal("10"))
+    health = d(floor_to_step(taxable * HEALTH_RATE, d("10")))
+    care = d(floor_to_step(health * CARE_RATE, d("10")))
+    employ = d(floor_to_step(taxable * EMPLOY_RATE, d("10")))
 
-    # AK = 장기요양 = ROUNDDOWN(AJ*0.1295,-1)
-    care = floor_to_step(health * CARE_RATE, Decimal("10"))
-
-    # AL = 고용보험 = ROUNDDOWN(AF*0.009,-1)
-    employ = floor_to_step(taxable * EMPLOY_RATE, Decimal("10"))
-
-    # AN = 총 공제금액 = SUM(AG:AM)
     total_deduct = income_tax + resident_tax + pension + health + care + employ + etc_deduct
-
-    # AO = 실지급액 = Y - AN
     net_pay = monthly_pay - total_deduct
 
-    # 검증값
     diff = (base_pay + fixed_ot_pay + allowances_sum) - monthly_pay
     diff_abs = abs(diff)
 
@@ -225,6 +345,13 @@ st.info(
     "최종 판단과 책임은 사용자에게 있습니다"
 )
 
+tbl_status = load_withholding_table()
+if not tbl_status["ok"]:
+    st.error(f"간이세액표 로드 실패. {tbl_status['message']}")
+    st.caption("GitHub 저장소에 엑셀 파일을 업로드했는지 확인하세요")
+else:
+    st.caption("소득세는 업로드 엑셀의 간이세액표 시트를 그대로 사용합니다")
+
 with st.sidebar:
     st.header("입력")
 
@@ -239,6 +366,11 @@ with st.sidebar:
     st.subheader("최저임금")
     min_wage_int = st.number_input("최저시급", min_value=0, value=10320, step=10, format="%d")
     inclusion_ratio = st.number_input("최저 산입비율", min_value=0.0, max_value=1.0, value=0.0, step=0.01)
+
+    st.divider()
+    st.subheader("소득세 입력")
+    family_count = st.number_input("공제대상가족수", min_value=1, max_value=11, value=1, step=1, format="%d")
+    children_8to20 = st.number_input("8세 이상 20세 이하", min_value=0, value=0, step=1, format="%d")
 
     st.divider()
     st.subheader("비과세 수당")
@@ -271,6 +403,8 @@ try:
         grade=d(grade_int),
         etc_allow=d(etc_allow_int),
         etc_deduct=d(etc_deduct_int),
+        family_count=int(family_count),
+        children_8to20=int(children_8to20),
     )
 except Exception as e:
     st.error(str(e))
@@ -320,7 +454,6 @@ with c1:
 with c2:
     st.metric("총 공제금액", won(r["total_deduct"]))
     st.metric("실지급액", won(r["net_pay"]))
-    st.caption("소득세는 업로드 엑셀에서 #REF!로 0 처리되는 상태를 그대로 반영했습니다")
 
 st.divider()
 st.subheader("검증")
